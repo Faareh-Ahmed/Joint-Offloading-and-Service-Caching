@@ -28,6 +28,7 @@ import random
 
 import numpy as np
 import torch
+torch.set_num_threads(4)
 import torch.nn as nn
 import torch.optim as optim
 

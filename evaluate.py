@@ -18,8 +18,20 @@ from environment import MECEnvironment
 from baselines import ALL_BASELINES
 
 
-def evaluate_agent(agent, sys_cfg, n_episodes=10, seed=1000):
-    """Runs the trained PPO agent greedily and returns the average per-device cost."""
+def evaluate_agent(agent, sys_cfg, n_episodes=10, seed=1000, use_mask=True, invalid_penalty=50.0):
+    """Runs the trained PPO agent and returns the average per-device cost.
+
+    For use_mask=True  : uses the masked policy (proposed approach); only valid
+                         actions ever reach the environment.
+    For use_mask=False : raw logit argmax is used (penalty-based baseline).
+                         Invalid cache decisions are silently clamped to NOT_CACHE;
+                         devices that try to offload to edge when the service is not
+                         cached fall back to LOCAL execution.  The reported cost is
+                         the *physical* system cost only — training penalties are
+                         NOT added here, consistent with Figs. 6–12 of the paper.
+    """
+    import torch
+    from environment import LOCAL, EDGE, CACHE, NOT_CACHE
     env = MECEnvironment(sys_cfg, seed=seed)
     costs = []
     for ep in range(n_episodes):
@@ -28,9 +40,40 @@ def evaluate_agent(agent, sys_cfg, n_episodes=10, seed=1000):
         while not done:
             state_vec = env.state_vector(state)
             task_types = state["tau"]
-            cache_action, offload_action, _, _, _, _ = agent.select_action(
-                state_vec, task_types, env, use_old_policy=False, deterministic=True)
-            state, reward, done, info = env.step(cache_action, offload_action)
+            if use_mask:
+                cache_action, offload_action, _, _, _, _ = agent.select_action(
+                    state_vec, task_types, env, use_old_policy=False, deterministic=True)
+                env_cache_action, env_offload_action = cache_action, offload_action
+            else:
+                state_t = torch.as_tensor(state_vec, dtype=torch.float32, device=agent.device).unsqueeze(0)
+                with torch.no_grad():
+                    c_logits, o_logits, _ = agent.net(state_t)
+                c_logits_np = c_logits.squeeze(0).cpu().numpy()
+                o_logits_np = o_logits.squeeze(0).cpu().numpy()
+
+                # Enforce storage constraint: if over budget, clamp to NOT_CACHE
+                c_act = np.argmax(c_logits_np, axis=-1)
+                rem = sys_cfg.mec_storage_capacity_mb
+                env_cache_action = np.zeros(agent.K, dtype=np.int64)
+                for k in range(agent.K):
+                    if c_act[k] == CACHE and rem >= sys_cfg.service_storage_mb:
+                        rem -= sys_cfg.service_storage_mb
+                        env_cache_action[k] = CACHE
+                    else:
+                        env_cache_action[k] = NOT_CACHE
+
+                # Enforce cache-coupling constraint: invalid edge requests fall
+                # back to local execution (physical cost only, no penalty added)
+                o_act = np.argmax(o_logits_np, axis=-1)
+                env_offload_action = np.zeros(agent.M, dtype=np.int64)
+                for m in range(agent.M):
+                    if o_act[m] == EDGE and env_cache_action[task_types[m]] == NOT_CACHE:
+                        env_offload_action[m] = LOCAL  # fall back — no penalty term
+                    else:
+                        env_offload_action[m] = o_act[m]
+
+            state, reward, done, info = env.step(env_cache_action, env_offload_action)
+            # Report only the physical system cost — no training penalties
             costs.append(info["avg_cost"])
     return float(np.mean(costs))
 
@@ -53,9 +96,11 @@ def evaluate_baseline(scheme_cls, sys_cfg, n_episodes=10, seed=2000):
     return float(np.mean(costs))
 
 
-def compare_all(agent, sys_cfg, n_episodes=10):
-    """Returns {scheme_name: avg_cost} for the proposed approach and all baselines."""
-    results = {"Proposed Approach": evaluate_agent(agent, sys_cfg, n_episodes)}
+def compare_all(agent, sys_cfg, n_episodes=10, agent_penalty=None, invalid_penalty=50.0):
+    """Returns {scheme_name: avg_cost} for the proposed approach, penalty PPO, and all baselines."""
+    results = {"Proposed Approach": evaluate_agent(agent, sys_cfg, n_episodes, use_mask=True)}
+    if agent_penalty is not None:
+        results["PPO-based (Penalty=50)"] = evaluate_agent(agent_penalty, sys_cfg, n_episodes, use_mask=False, invalid_penalty=invalid_penalty)
     for key, cls in ALL_BASELINES.items():
         results[cls.name] = evaluate_baseline(cls, sys_cfg, n_episodes)
     return results

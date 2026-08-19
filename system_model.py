@@ -154,14 +154,21 @@ def edge_computing(i_size, phi, o_size, Ru, Rd, n_edge_devices, cfg):
     n_edge_devices : number of devices concurrently offloading to the edge
                      at this time slot (sum_{m=1}^{M} d^e_m(t)); the MEC
                      server equally shares its computing resource among them.
+
+    NOTE: i_size / o_size arrive in MB (MegaBytes); Ru / Rd are in Mb/s.
+    Convert MB -> Mb (x8) before dividing by the rate.
     """
     n_edge_devices = max(1, n_edge_devices)
     shared_f_edge = cfg.f_edge_hz / n_edge_devices
 
-    T_e = i_size / Ru + phi / shared_f_edge + o_size / Rd
-    E_e = (cfg.p_tr_w * (i_size / Ru)
+    # Convert MegaBytes to Megabits for transmission-time calculation
+    i_size_mb = i_size * 8
+    o_size_mb = o_size * 8
+
+    T_e = i_size_mb / Ru + phi / shared_f_edge + o_size_mb / Rd
+    E_e = (cfg.p_tr_w * (i_size_mb / Ru)
            + cfg.p_idle_w * (phi / shared_f_edge)
-           + cfg.p_receive_w * (o_size / Rd))
+           + cfg.p_receive_w * (o_size_mb / Rd))
     return T_e, E_e
 
 
@@ -169,12 +176,18 @@ def cloud_computing(i_size, o_size, Ru, Rd, cfg):
     """
     eq. (9):  T_c = i/Ru + (i+o)/Rc + o/Rd
     eq. (10): E_c = p_tr * i/Ru + p_id * (i+o)/Rc + p_re * o/Rd
+
+    NOTE: i_size / o_size arrive in MB (MegaBytes); Ru / Rd / Rc are in Mb/s.
+    Convert MB -> Mb (x8) before dividing by the rate.
     """
     Rc = cfg.cloud_rate_mbps
-    T_c = i_size / Ru + (i_size + o_size) / Rc + o_size / Rd
-    E_c = (cfg.p_tr_w * (i_size / Ru)
-           + cfg.p_idle_w * ((i_size + o_size) / Rc)
-           + cfg.p_receive_w * (o_size / Rd))
+    # Convert MegaBytes to Megabits for transmission-time calculation
+    i_size_mb = i_size * 8
+    o_size_mb = o_size * 8
+    T_c = i_size_mb / Ru + (i_size_mb + o_size_mb) / Rc + o_size_mb / Rd
+    E_c = (cfg.p_tr_w * (i_size_mb / Ru)
+           + cfg.p_idle_w * ((i_size_mb + o_size_mb) / Rc)
+           + cfg.p_receive_w * (o_size_mb / Rd))
     return T_c, E_c
 
 

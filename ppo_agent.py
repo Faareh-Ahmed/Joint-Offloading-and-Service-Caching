@@ -19,6 +19,7 @@ from typing import List
 
 import numpy as np
 import torch
+torch.set_num_threads(4)
 import torch.nn as nn
 import torch.optim as optim
 
@@ -100,8 +101,8 @@ class PPOAgent:
 
         with torch.no_grad():
             cache_logits, offload_logits, value = net(state_t)
-        cache_logits = cache_logits.squeeze(0)     # (K, 2)
-        offload_logits = offload_logits.squeeze(0)  # (M, 3)
+        c_logits_np = cache_logits.squeeze(0).cpu().numpy()     # (K, 2)
+        o_logits_np = offload_logits.squeeze(0).cpu().numpy()   # (M, 3)
 
         cfg = self.sys_cfg
         remaining_budget = cfg.mec_storage_capacity_mb
@@ -112,11 +113,13 @@ class PPOAgent:
         for k in range(self.K):
             mask_np = env.get_cache_mask(remaining_budget)
             cache_masks[k] = mask_np
-            mask = torch.as_tensor(mask_np, device=self.device)
-            dist = masked_categorical(cache_logits[k], mask)
-            a_k = dist.probs.argmax() if deterministic else dist.sample()
-            cache_action[k] = int(a_k.item())
-            cache_logp += float(dist.log_prob(a_k).item())
+            logits_masked = c_logits_np[k] + (1.0 - mask_np) * (-1.0e9)
+            logits_max = np.max(logits_masked)
+            exp_logits = np.exp(logits_masked - logits_max)
+            probs = exp_logits / np.sum(exp_logits)
+            a_k = np.argmax(probs) if deterministic else np.random.choice(len(probs), p=probs)
+            cache_action[k] = a_k
+            cache_logp += np.log(probs[a_k] + 1e-12)
             if cache_action[k] == CACHE:
                 remaining_budget -= cfg.service_storage_mb
 
@@ -126,13 +129,15 @@ class PPOAgent:
         for m in range(self.M):
             mask_np = env.get_offload_mask(int(task_types[m]), cache_action)
             offload_masks[m] = mask_np
-            mask = torch.as_tensor(mask_np, device=self.device)
-            dist = masked_categorical(offload_logits[m], mask)
-            a_m = dist.probs.argmax() if deterministic else dist.sample()
-            offload_action[m] = int(a_m.item())
-            offload_logp += float(dist.log_prob(a_m).item())
+            logits_masked = o_logits_np[m] + (1.0 - mask_np) * (-1.0e9)
+            logits_max = np.max(logits_masked)
+            exp_logits = np.exp(logits_masked - logits_max)
+            probs = exp_logits / np.sum(exp_logits)
+            a_m = np.argmax(probs) if deterministic else np.random.choice(len(probs), p=probs)
+            offload_action[m] = a_m
+            offload_logp += np.log(probs[a_m] + 1e-12)
 
-        total_logp = cache_logp + offload_logp
+        total_logp = float(cache_logp + offload_logp)
         return (cache_action, offload_action, cache_masks, offload_masks,
                 total_logp, float(value.item()))
 
@@ -148,19 +153,24 @@ class PPOAgent:
                                transitions were originally sampled
         offload_masks_batch : (batch, M, 3)
         """
+        import torch.nn.functional as F
         cache_logits, offload_logits, values = self.net(states)
 
         cache_masked = cache_logits + (1.0 - cache_masks_batch) * (-1.0e9)
         offload_masked = offload_logits + (1.0 - offload_masks_batch) * (-1.0e9)
 
-        cache_dist = torch.distributions.Categorical(logits=cache_masked)
-        offload_dist = torch.distributions.Categorical(logits=offload_masked)
+        cache_log_probs = F.log_softmax(cache_masked, dim=-1)
+        cache_logp = cache_log_probs.gather(2, cache_actions.unsqueeze(-1)).squeeze(-1).sum(dim=1)
+        cache_probs = torch.exp(cache_log_probs)
+        cache_entropy = -(cache_probs * cache_log_probs).sum(dim=-1).sum(dim=1)
 
-        cache_logp = cache_dist.log_prob(cache_actions).sum(dim=1)      # sum over K subactions
-        offload_logp = offload_dist.log_prob(offload_actions).sum(dim=1)  # sum over M subactions
+        offload_log_probs = F.log_softmax(offload_masked, dim=-1)
+        offload_logp = offload_log_probs.gather(2, offload_actions.unsqueeze(-1)).squeeze(-1).sum(dim=1)
+        offload_probs = torch.exp(offload_log_probs)
+        offload_entropy = -(offload_probs * offload_log_probs).sum(dim=-1).sum(dim=1)
+
         total_logp = cache_logp + offload_logp
-
-        entropy = cache_dist.entropy().sum(dim=1) + offload_dist.entropy().sum(dim=1)
+        entropy = cache_entropy + offload_entropy
 
         return total_logp, entropy, values
 

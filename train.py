@@ -1,7 +1,7 @@
 """
 train.py
 ========
-Implements Algorithm 1 of the paper ("Proposed DRL-Based Approach") almost
+Implements the paper ("Proposed DRL-Based Approach") almost
 line-for-line:
 
     1: Initialize actor/critic weights (orthogonal) and memory buffer D
@@ -40,13 +40,9 @@ def collect_rollout(env: MECEnvironment, agent: PPOAgent, rollout_len: int, use_
     Executes `rollout_len` environment steps under the old policy and stores
     the resulting transitions in `agent.buffer` (Algorithm 1, lines 3-10).
 
-    If use_mask is False, the offloading action is instead sampled from the
-    *unmasked* distribution and a large penalty (`invalid_penalty`) is
-    subtracted from the reward whenever an invalid edge-offload is chosen
-    (task requests a service that is not cached); the action is then
-    corrected to LOCAL execution so the environment's internal constraints
-    still hold, mirroring the "large penalty" baseline described in
-    Sec. IV-C / Sec. V-B.
+    If use_mask is False, offloading and caching actions are sampled from the
+    *unmasked* policy distribution and a penalty (`invalid_penalty`) is
+    subtracted from the reward whenever an invalid action is chosen.
     """
     state = env._state if env._state is not None else env.reset()
     for _ in range(rollout_len):
@@ -56,13 +52,14 @@ def collect_rollout(env: MECEnvironment, agent: PPOAgent, rollout_len: int, use_
         if use_mask:
             (cache_action, offload_action, cache_masks, offload_masks,
              logp, value) = agent.select_action(state_vec, task_types, env, use_old_policy=True)
+            env_cache_action, env_offload_action = cache_action, offload_action
             penalty = 0.0
         else:
-            (cache_action, offload_action, cache_masks, offload_masks,
-             logp, value, penalty) = select_action_no_mask(agent, state_vec, task_types, env,
-                                                             invalid_penalty)
+            (cache_action, offload_action, env_cache_action, env_offload_action,
+             cache_masks, offload_masks, logp, value, penalty) = select_action_no_mask(
+                agent, state_vec, task_types, env, invalid_penalty)
 
-        next_state, reward, done, info = env.step(cache_action, offload_action)
+        next_state, reward, done, info = env.step(env_cache_action, env_offload_action)
         reward -= penalty
 
         agent.buffer.add(Transition(
@@ -92,53 +89,64 @@ def collect_rollout(env: MECEnvironment, agent: PPOAgent, rollout_len: int, use_
 def select_action_no_mask(agent: PPOAgent, state_vec, task_types, env, invalid_penalty):
     """Unmasked action sampling used by the 'PPO-based caching and offloading' baseline."""
     import torch
-    from networks import masked_categorical
+    from environment import LOCAL, EDGE, CACHE, NOT_CACHE
 
     net = agent.old_net
     state_t = torch.as_tensor(state_vec, dtype=torch.float32, device=agent.device).unsqueeze(0)
     with torch.no_grad():
         cache_logits, offload_logits, value = net(state_t)
-    cache_logits = cache_logits.squeeze(0)
-    offload_logits = offload_logits.squeeze(0)
+    c_logits_np = cache_logits.squeeze(0).cpu().numpy()
+    o_logits_np = offload_logits.squeeze(0).cpu().numpy()
 
     cfg = agent.sys_cfg
-    all_valid_cache = np.ones((agent.K, 2), dtype=np.float32)  # only mask never applied here
+    all_valid_cache = np.ones((agent.K, 2), dtype=np.float32)
     all_valid_offload = np.ones((agent.M, 3), dtype=np.float32)
 
     cache_action = np.zeros(agent.K, dtype=np.int64)
-    remaining_budget = cfg.mec_storage_capacity_mb
+    env_cache_action = np.zeros(agent.K, dtype=np.int64)
     cache_logp = 0.0
+    cache_penalty = 0.0
+    rem_budget = cfg.mec_storage_capacity_mb
+
     for k in range(agent.K):
-        # Storage capacity (C2) is a hard physical constraint (can't store
-        # more bits than exist), so it is still respected; only the
-        # offloading<->caching coupling (C5) is left unmasked, matching the
-        # paper's description that invalid *offloading* actions are the
-        # ones handled by masking vs. penalty.
-        mask_np = env.get_cache_mask(remaining_budget)
-        all_valid_cache[k] = mask_np
-        mask = torch.as_tensor(mask_np, device=agent.device)
-        dist = masked_categorical(cache_logits[k], mask)
-        a_k = dist.sample()
-        cache_action[k] = int(a_k.item())
-        cache_logp += float(dist.log_prob(a_k).item())
-        if cache_action[k] == CACHE:
-            remaining_budget -= cfg.service_storage_mb
+        logits_k = c_logits_np[k]
+        exp_logits = np.exp(logits_k - np.max(logits_k))
+        probs = exp_logits / np.sum(exp_logits)
+        a_k = np.random.choice(len(probs), p=probs)
+        cache_action[k] = a_k
+        cache_logp += np.log(probs[a_k] + 1e-12)
+        if a_k == CACHE:
+            if rem_budget >= cfg.service_storage_mb:
+                rem_budget -= cfg.service_storage_mb
+                env_cache_action[k] = CACHE
+            else:
+                cache_penalty += invalid_penalty
+                env_cache_action[k] = NOT_CACHE
+        else:
+            env_cache_action[k] = NOT_CACHE
 
     offload_action = np.zeros(agent.M, dtype=np.int64)
+    env_offload_action = np.zeros(agent.M, dtype=np.int64)
     offload_logp = 0.0
-    penalty = 0.0
-    for m in range(agent.M):
-        from torch.distributions import Categorical
-        dist = Categorical(logits=offload_logits[m])  # unmasked
-        a_m = dist.sample()
-        offload_action[m] = int(a_m.item())
-        offload_logp += float(dist.log_prob(a_m).item())
-        if offload_action[m] == EDGE and cache_action[task_types[m]] == 0:
-            penalty += invalid_penalty
-            offload_action[m] = LOCAL  # environment still requires a feasible action
+    offload_penalty = 0.0
 
-    total_logp = cache_logp + offload_logp
-    return cache_action, offload_action, all_valid_cache, all_valid_offload, total_logp, float(value.item()), penalty
+    for m in range(agent.M):
+        logits_m = o_logits_np[m]
+        exp_logits = np.exp(logits_m - np.max(logits_m))
+        probs = exp_logits / np.sum(exp_logits)
+        a_m = np.random.choice(len(probs), p=probs)
+        offload_action[m] = a_m
+        offload_logp += np.log(probs[a_m] + 1e-12)
+        if a_m == EDGE and env_cache_action[task_types[m]] == NOT_CACHE:
+            offload_penalty += invalid_penalty
+            env_offload_action[m] = LOCAL
+        else:
+            env_offload_action[m] = a_m
+
+    total_logp = float(cache_logp + offload_logp)
+    total_penalty = cache_penalty + offload_penalty
+    return (cache_action, offload_action, env_cache_action, env_offload_action,
+            all_valid_cache, all_valid_offload, total_logp, float(value.item()), total_penalty)
 
 
 def train(sys_cfg: SystemConfig, ppo_cfg: PPOConfig, use_mask: bool = True,
