@@ -80,6 +80,3 @@ All masking uses the formula `z'_i = z_i + (1 − m_i) · C` (eq. 22, where *C* 
 
 where `T_m(t)` and `E_m(t)` are the completion time and energy consumption for device *m*, and `λ_t = λ_e = 0.5` by default.
 
-### PPO baseline (penalty mode)
-
-Running with `--no-mask --penalty 50` reproduces the "PPO-based caching and offloading" ablation from the paper. Invalid actions are penalized during training but the physical cost reported at evaluation time does not include the penalty term.
